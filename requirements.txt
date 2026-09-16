@@ -1,0 +1,9 @@
+streamlit
+Flask
+gunicorn
+opencv-python-headless
+numpy
+ultralytics
+paddlex
+paddlepaddle
+imageio-ffmpeg

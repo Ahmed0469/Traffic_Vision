@@ -7,3 +7,4 @@ ultralytics
 paddlex
 paddlepaddle
 imageio-ffmpeg
+python-bidi

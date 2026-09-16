@@ -1,7 +1,7 @@
 streamlit
 Flask
 gunicorn
-opencv-python
+opencv-python-headless
 numpy
 ultralytics
 paddlex

@@ -6,10 +6,16 @@ from pathlib import Path
 import cv2
 import streamlit as st
 
-from src.object_detection import VideoProcessingCancelled, process_video
+from src.object_detection import (
+    VideoProcessingCancelled,
+    load_video_frames,
+    process_selected_frames,
+    read_video_frame,
+)
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
-ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+MAX_SELECTED_FRAMES = 10
+ALLOWED_EXTENSIONS = {".mp4", ".mov"}
 
 st.set_page_config(page_title="Traffic Vision | Smart Road Analysis", page_icon="🚦", layout="wide")
 
@@ -38,6 +44,12 @@ st.markdown(
     [data-testid="stFileUploader"] section { background: transparent; }
     .stButton > button, .stDownloadButton > button { border-radius: 0; border: 1px solid var(--cream); background: var(--cream); color: #151612; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
     .stButton > button:hover, .stDownloadButton > button:hover { border-color: #f1e7cb; background: #f1e7cb; color: #151612; }
+    [data-testid="stDialog"] > div { background: #0d0f0d; border: 1px solid #45483f; border-radius: 0; }
+    [data-testid="stDialog"] h2 { color: var(--cream) !important; }
+    [data-testid="stDialog"] [data-testid="stMarkdownContainer"] p { color: #d4d0c7; }
+    [data-testid="stDialog"] .stButton > button { background: var(--cream) !important; border-color: var(--cream) !important; color: #151612 !important; -webkit-text-fill-color: #151612 !important; font-size: 1rem !important; font-weight: 800 !important; }
+    [data-testid="stDialog"] .stButton > button p,
+    [data-testid="stDialog"] .stButton > button span { color: #151612 !important; -webkit-text-fill-color: #151612 !important; font-size: 1rem !important; font-weight: 800 !important; opacity: 1 !important; }
     .stop-button button { border-color: #4b4d47; background: transparent; color: #aaa99f; }
     .stProgress > div > div > div > div { background-color: var(--green); }
     .warning { color: #c7a866; background: #231e12; border-left: 2px solid #c7a866; padding: .7rem .8rem; font-size: .78rem; line-height: 1.45; }
@@ -55,30 +67,126 @@ def initialize_state():
         st.session_state.job = None
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = 0
+    if "video" not in st.session_state:
+        st.session_state.video = None
+    if "selected_frames" not in st.session_state:
+        st.session_state.selected_frames = []
+    if "active_frame" not in st.session_state:
+        st.session_state.active_frame = 0
+    if "processing_notice_upload_key" not in st.session_state:
+        st.session_state.processing_notice_upload_key = None
 
 
 def reset_for_new_upload():
+    video = st.session_state.video
+    if video is not None:
+        shutil.rmtree(video["temporary_directory"], ignore_errors=True)
+    st.session_state.video = None
     st.session_state.job = None
+    st.session_state.selected_frames = []
+    st.session_state.processing_notice_upload_key = None
     st.session_state.uploader_key += 1
     st.rerun()
 
 
-def run_job(job):
-    temporary_directory = Path(tempfile.mkdtemp(prefix="traffic_vision_"))
-    input_path = temporary_directory / f"input{job['suffix']}"
-    output_path = temporary_directory / "annotated_result.mp4"
-    input_path.write_bytes(job["input_bytes"])
+def load_uploaded_video(uploaded_file):
+    upload_key = getattr(uploaded_file, "file_id", f"{uploaded_file.name}:{uploaded_file.size}")
+    current_video = st.session_state.video
+    if (
+        current_video is not None
+        and current_video["upload_key"] == upload_key
+        and "frames" in current_video
+    ):
+        return current_video, ""
+    if current_video is not None:
+        shutil.rmtree(current_video["temporary_directory"], ignore_errors=True)
+    st.session_state.video = None
+    st.session_state.job = None
+    st.session_state.selected_frames = []
+    st.session_state.active_frame = 0
 
+    temporary_directory = Path(tempfile.mkdtemp(prefix="traffic_vision_"))
+    input_path = temporary_directory / f"input{Path(uploaded_file.name).suffix.lower()}"
+    input_bytes = uploaded_file.getvalue()
+    input_path.write_bytes(input_bytes)
+    cap = cv2.VideoCapture(str(input_path))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if cap.isOpened() else 0
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if cap.isOpened() else 0
+    readable = cap.isOpened() and frame_count > 0 and width > 0 and height > 0
+    cap.release()
+    if not readable:
+        shutil.rmtree(temporary_directory, ignore_errors=True)
+        st.session_state.video = None
+        return None, "The uploaded file is not a readable video."
+
+    video = {
+        "upload_key": upload_key,
+        "input_path": input_path,
+        "temporary_directory": temporary_directory,
+        "name": Path(uploaded_file.name).stem,
+        "frame_count": frame_count,
+        "width": width,
+        "height": height,
+    }
+    try:
+        video["frames"] = load_video_frames(input_path)
+    except (OSError, ValueError) as error:
+        shutil.rmtree(temporary_directory, ignore_errors=True)
+        return None, str(error)
+    video["frame_count"] = len(video["frames"])
+    st.session_state.video = video
+    return video, ""
+
+
+def acknowledge_processing_notice(upload_key):
+    st.session_state.processing_notice_upload_key = upload_key
+    st.rerun(scope="app")
+
+
+@st.dialog("Optimized Processing Mode", dismissible=False)
+def show_processing_notice(upload_key):
+    st.markdown(
+        "To keep analysis responsive and support consistent access across our shared cloud environment, "
+        "Traffic Vision prepares video frames for review and runs detection only on the ten frames you select. "
+        "This workload-aware approach helps maintain predictable performance for everyone."
+    )
+    st.button(
+        "SELECT 10 FRAMES",
+        type="primary",
+        use_container_width=True,
+        on_click=acknowledge_processing_notice,
+        args=(upload_key,),
+    )
+
+
+def run_job(job):
     def update_progress(processed, total):
         with job["lock"]:
             job["processed"] = processed
             job["total"] = total
 
     try:
-        process_video(input_path, output_path, update_progress, job["cancel_event"].is_set)
+        results = process_selected_frames(
+            job["input_path"],
+            job["frame_indices"],
+            update_progress,
+            job["cancel_event"].is_set,
+        )
+        encoded_results = []
+        for frame_index, original, annotated in results:
+            _, original_bytes = cv2.imencode(".jpg", original)
+            _, annotated_bytes = cv2.imencode(".jpg", annotated)
+            encoded_results.append(
+                {
+                    "frame_number": frame_index + 1,
+                    "original": original_bytes.tobytes(),
+                    "annotated": annotated_bytes.tobytes(),
+                }
+            )
         with job["lock"]:
             job["state"] = "complete"
-            job["result_bytes"] = output_path.read_bytes()
+            job["result_frames"] = encoded_results
     except VideoProcessingCancelled:
         with job["lock"]:
             job["state"] = "cancelled"
@@ -86,29 +194,135 @@ def run_job(job):
         with job["lock"]:
             job["state"] = "error"
             job["error"] = str(error)
-    finally:
-        shutil.rmtree(temporary_directory, ignore_errors=True)
 
 
-def start_job(uploaded_file, width, height):
-    warning = ""
-    if width > 1024 or height > 1024:
-        warning = f"This video is {width}x{height}. It may take more time to process; try a smaller video with lower dimensions for faster results."
+def start_job(video):
     job = {
         "state": "processing",
-        "input_bytes": uploaded_file.getvalue(),
-        "suffix": Path(uploaded_file.name).suffix.lower(),
-        "name": Path(uploaded_file.name).stem,
+        "input_path": video["input_path"],
+        "frame_indices": [item["index"] for item in st.session_state.selected_frames],
         "processed": 0,
         "total": 0,
-        "warning": warning,
         "cancel_event": threading.Event(),
         "lock": threading.Lock(),
-        "result_bytes": None,
+        "result_frames": None,
         "error": "",
     }
     st.session_state.job = job
     threading.Thread(target=run_job, args=(job,), daemon=True).start()
+
+
+def set_active_frame(frame_index):
+    st.session_state.active_frame = frame_index
+
+
+def add_active_frame(video):
+    frame_index = st.session_state.active_frame
+    selected_frames = st.session_state.selected_frames
+    if any(item["index"] == frame_index for item in selected_frames):
+        return
+    if len(selected_frames) >= MAX_SELECTED_FRAMES:
+        return
+
+    frame = read_video_frame(video["input_path"], frame_index)
+    success, encoded_frame = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    if not success:
+        raise ValueError(f"Could not save frame {frame_index + 1}.")
+    selected_frames.append({"index": frame_index, "image": encoded_frame.tobytes()})
+    st.session_state.job = None
+
+
+@st.fragment
+def render_frame_navigator(video):
+    frame_count = len(video["frames"])
+    st.markdown("**Choose frames for detection**")
+    current_frame = st.slider(
+        "Frame timeline",
+        min_value=0,
+        max_value=frame_count - 1,
+        key="active_frame",
+        format="Frame %d",
+    )
+
+    control_columns = st.columns(4, gap="small")
+    with control_columns[0]:
+        st.button("⏮ First Frame", on_click=set_active_frame, args=(0,), use_container_width=True)
+    with control_columns[1]:
+        st.button(
+            "◀ Prev Frame",
+            on_click=set_active_frame,
+            args=(max(0, current_frame - 1),),
+            disabled=current_frame == 0,
+            use_container_width=True,
+        )
+    with control_columns[2]:
+        st.button(
+            "▶ Next Frame",
+            on_click=set_active_frame,
+            args=(min(frame_count - 1, current_frame + 1),),
+            disabled=current_frame == frame_count - 1,
+            use_container_width=True,
+        )
+    with control_columns[3]:
+        st.button(
+            "⏭ Last Frame",
+            on_click=set_active_frame,
+            args=(frame_count - 1,),
+            use_container_width=True,
+        )
+
+    st.image(
+        video["frames"][current_frame],
+        channels="RGB",
+        caption=f"Frame {current_frame + 1} of {frame_count}",
+        use_container_width=True,
+    )
+    selected_frames = st.session_state.selected_frames
+    frame_selected = any(item["index"] == current_frame for item in selected_frames)
+    try:
+        if st.button(
+            "📸 Select Frame for Detection",
+            type="primary",
+            disabled=frame_selected or len(selected_frames) >= MAX_SELECTED_FRAMES,
+            key=f"select-frame-{video['upload_key']}-{current_frame}",
+            use_container_width=True,
+        ):
+            add_active_frame(video)
+            st.rerun()
+    except (OSError, ValueError) as error:
+        st.error(str(error))
+
+    st.markdown(f"**Grabbed frames: {len(selected_frames)} / {MAX_SELECTED_FRAMES}**")
+    if selected_frames:
+        gallery_columns = st.columns(3, gap="small")
+        for position, item in enumerate(selected_frames):
+            with gallery_columns[position % len(gallery_columns)]:
+                st.image(
+                    video["frames"][item["index"]],
+                    channels="RGB",
+                    caption=f"Frame {item['index'] + 1}",
+                    use_container_width=True,
+                )
+                if st.button(
+                    f"Remove frame {item['index'] + 1}",
+                    key=f"remove-selected-{video['upload_key']}-{item['index']}",
+                    use_container_width=True,
+                ):
+                    selected_frames.pop(position)
+                    st.session_state.job = None
+                    st.rerun()
+
+    if len(selected_frames) < MAX_SELECTED_FRAMES:
+        st.caption(f"Select {MAX_SELECTED_FRAMES - len(selected_frames)} more frame(s).")
+    if st.button(
+        "Analyze selected frames",
+        type="primary",
+        disabled=len(selected_frames) != MAX_SELECTED_FRAMES,
+        key=f"analyze-frames-{video['upload_key']}",
+        use_container_width=True,
+    ):
+        start_job(video)
+        st.rerun()
 
 
 @st.fragment(run_every=0.7)
@@ -119,7 +333,7 @@ def render_processing(job):
         total = job["total"]
     if state == "processing":
         percent = round(processed / total * 100) if total else 0
-        status = f"Processing frame {processed} of {total}..." if total else "Starting analysis..."
+        status = f"Analyzing selected frame {processed} of {total}..." if total else "Starting analysis..."
         status_col, percent_col = st.columns([4, 1])
         with status_col:
             st.markdown(f'<div class="status">{status}</div>', unsafe_allow_html=True)
@@ -145,7 +359,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-left, right = st.columns([0.82, 1.18], gap="small")
+left, right = st.columns([1.1, 0.9], gap="small")
 
 with left:
     with st.container(border=True):
@@ -155,38 +369,77 @@ with left:
             type=sorted(ALLOWED_EXTENSIONS),
             help="Maximum 100 MB. Larger dimensions may take longer to process.",
             key=f"video-uploader-{st.session_state.uploader_key}",
-            disabled=job is not None and job["state"] == "processing",
+            disabled=job is not None and job["state"] in {"processing", "complete"},
         )
 
-        if uploaded_file is not None and (job is None or job["state"] not in {"processing", "complete"}):
+        video = st.session_state.video
+        video_error = ""
+        if uploaded_file is not None:
             if uploaded_file.size > MAX_UPLOAD_BYTES:
                 st.error("The video must be smaller than 100 MB.")
+                upload_key = getattr(uploaded_file, "file_id", f"{uploaded_file.name}:{uploaded_file.size}")
+                if video is not None and video["upload_key"] != upload_key:
+                    shutil.rmtree(video["temporary_directory"], ignore_errors=True)
+                    st.session_state.video = None
+                    st.session_state.job = None
+                    st.session_state.selected_frames = []
+                    st.session_state.active_frame = 0
+                    video = None
             else:
-                probe_path = Path(tempfile.mktemp(suffix=Path(uploaded_file.name).suffix))
-                probe_path.write_bytes(uploaded_file.getvalue())
-                cap = cv2.VideoCapture(str(probe_path))
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                readable = cap.isOpened() and width > 0 and height > 0
-                cap.release()
-                probe_path.unlink(missing_ok=True)
-                if not readable:
-                    st.error("The uploaded file is not a readable video.")
-                else:
-                    if width > 1024 or height > 1024:
-                        st.markdown(f'<div class="warning">This video is {width}x{height}. It may take more time to process; try a smaller video with lower dimensions for faster results.</div>', unsafe_allow_html=True)
-                    if st.button("Start analysis", type="primary"):
-                        start_job(uploaded_file, width, height)
-                        st.rerun()
+                upload_key = getattr(
+                    uploaded_file,
+                    "file_id",
+                    f"{uploaded_file.name}:{uploaded_file.size}",
+                )
+                if video is not None and video["upload_key"] != upload_key:
+                    shutil.rmtree(video["temporary_directory"], ignore_errors=True)
+                    st.session_state.video = None
+                    st.session_state.job = None
+                    st.session_state.selected_frames = []
+                    st.session_state.active_frame = 0
+                    video = None
+                if video is None:
+                    with st.spinner("Decoding frames for instant navigation..."):
+                        video, video_error = load_uploaded_video(uploaded_file)
+        elif video is not None:
+            shutil.rmtree(video["temporary_directory"], ignore_errors=True)
+            st.session_state.video = None
+            st.session_state.job = None
+            st.session_state.selected_frames = []
+            st.session_state.active_frame = 0
+            st.session_state.processing_notice_upload_key = None
+            video = None
+        job = st.session_state.job
+
+        if video_error:
+            st.error(video_error)
+
+        if video is not None:
+            st.markdown(
+                f'<div class="status">{video["width"]} × {video["height"]} · {video["frame_count"]} frames</div>',
+                unsafe_allow_html=True,
+            )
+            if video["frame_count"] < MAX_SELECTED_FRAMES:
+                st.warning("This video has fewer than 10 frames. Upload a video with at least 10 frames.")
+            elif job is None or job["state"] != "processing":
+                render_frame_navigator(video)
+                if st.session_state.processing_notice_upload_key != video["upload_key"]:
+                    show_processing_notice(video["upload_key"])
 
         if job is not None and job["state"] == "processing":
             render_processing(job)
         elif job is not None and job["state"] == "cancelled":
-            st.info("Analysis stopped. Choose another video.")
+            st.info("Analysis stopped. You can run the selected frames again or choose another video.")
+            if st.button("Run selected frames again", key="retry-cancelled"):
+                start_job(video)
+                st.rerun()
             if st.button("Use another video", key="new-video-cancelled"):
                 reset_for_new_upload()
         elif job is not None and job["state"] == "error":
-            st.error(f"Video processing failed: {job['error']}")
+            st.error(f"Frame processing failed: {job['error']}")
+            if st.button("Run selected frames again", key="retry-error"):
+                start_job(video)
+                st.rerun()
             if st.button("Use another video", key="new-video-error"):
                 reset_for_new_upload()
         elif job is not None and job["state"] == "complete":
@@ -196,16 +449,18 @@ with left:
 with right:
     with st.container(border=True):
         if job is not None and job["state"] == "complete":
-            st.subheader("Annotated result")
-            st.video(job["result_bytes"], format="video/mp4")
-            st.download_button(
-                "Download video",
-                data=job["result_bytes"],
-                file_name=f"{job['name']}_detections.mp4",
-                mime="video/mp4",
-            )
+            st.subheader("Before and after")
+            for result in job["result_frames"]:
+                st.markdown(f"**Frame {result['frame_number']}**")
+                original_column, detected_column = st.columns(2)
+                with original_column:
+                    st.caption("Before")
+                    st.image(result["original"], use_container_width=True)
+                with detected_column:
+                    st.caption("After")
+                    st.image(result["annotated"], use_container_width=True)
         else:
-            st.subheader("Annotated result")
-            st.markdown('<p class="status">Your processed video will appear here.</p>', unsafe_allow_html=True)
+            st.subheader("Frame comparisons")
+            st.markdown('<p class="status">The ten selected frames will appear here after analysis.</p>', unsafe_allow_html=True)
 
 st.markdown('<div class="footer"><span>Traffic Vision · Computer vision for safer roads</span><span>01 / Analysis workspace</span></div>', unsafe_allow_html=True)

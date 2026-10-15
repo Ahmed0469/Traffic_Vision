@@ -148,11 +148,11 @@ def acknowledge_processing_notice(upload_key):
 def show_processing_notice(upload_key):
     st.markdown(
         "To keep analysis responsive and support consistent access across our shared cloud environment, "
-        "Traffic Vision prepares video frames for review and runs detection only on the ten frames you select. "
+        "Traffic Vision prepares video frames for review and runs detection only on the frames you select, up to ten. "
         "This workload-aware approach helps maintain predictable performance for everyone."
     )
     st.button(
-        "SELECT 10 FRAMES",
+        "SELECT UP TO 10 FRAMES",
         type="primary",
         use_container_width=True,
         on_click=acknowledge_processing_notice,
@@ -312,12 +312,12 @@ def render_frame_navigator(video):
                     st.session_state.job = None
                     st.rerun()
 
-    if len(selected_frames) < MAX_SELECTED_FRAMES:
-        st.caption(f"Select {MAX_SELECTED_FRAMES - len(selected_frames)} more frame(s).")
+    if not selected_frames:
+        st.caption("Select at least one frame. You can choose up to 10.")
     if st.button(
         "Analyze selected frames",
         type="primary",
-        disabled=len(selected_frames) != MAX_SELECTED_FRAMES,
+        disabled=not selected_frames,
         key=f"analyze-frames-{video['upload_key']}",
         use_container_width=True,
     ):
@@ -419,9 +419,7 @@ with left:
                 f'<div class="status">{video["width"]} × {video["height"]} · {video["frame_count"]} frames</div>',
                 unsafe_allow_html=True,
             )
-            if video["frame_count"] < MAX_SELECTED_FRAMES:
-                st.warning("This video has fewer than 10 frames. Upload a video with at least 10 frames.")
-            elif job is None or job["state"] != "processing":
+            if video["frame_count"] > 0 and (job is None or job["state"] != "processing"):
                 render_frame_navigator(video)
                 if st.session_state.processing_notice_upload_key != video["upload_key"]:
                     show_processing_notice(video["upload_key"])
@@ -461,6 +459,6 @@ with right:
                     st.image(result["annotated"], use_container_width=True)
         else:
             st.subheader("Frame comparisons")
-            st.markdown('<p class="status">The ten selected frames will appear here after analysis.</p>', unsafe_allow_html=True)
+            st.markdown('<p class="status">Your selected frames will appear here after analysis.</p>', unsafe_allow_html=True)
 
 st.markdown('<div class="footer"><span>Traffic Vision · Computer vision for safer roads</span><span>01 / Analysis workspace</span></div>', unsafe_allow_html=True)
